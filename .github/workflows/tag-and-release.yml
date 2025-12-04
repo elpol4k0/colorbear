@@ -1,0 +1,160 @@
+name: Release ColorBear
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Run tests
+        run: go test -v ./...
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Get latest tag
+        id: get_tag
+        run: |
+          git fetch --tags
+          TAG=$(git tag --sort=-creatordate | head -n 1)
+          if [ -z "$TAG" ]; then
+            TAG="v0.0.0"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Decide bump (conventional commits)
+        id: bump_decision
+        run: |
+          TAG="${{ steps.get_tag.outputs.tag }}"
+          
+          COMMITS=$(git log $TAG..HEAD --pretty=format:"%s%n%b")
+          
+          BUMP="patch"
+          SHOULD_RELEASE="false"
+          
+          if echo "$COMMITS" | grep -Eq "BREAKING CHANGE|!:"; then
+            BUMP="major"
+            SHOULD_RELEASE="true"
+          elif echo "$COMMITS" | grep -Eq "^feat"; then
+            BUMP="minor"
+            SHOULD_RELEASE="true"
+          elif echo "$COMMITS" | grep -Eq "^fix"; then
+            BUMP="patch"
+            SHOULD_RELEASE="true"
+          fi
+          
+          echo "bump=$BUMP" >> $GITHUB_OUTPUT
+          echo "should_release=$SHOULD_RELEASE" >> $GITHUB_OUTPUT
+
+      - name: Bump version and create tag
+        id: bump_version
+        if: steps.bump_decision.outputs.should_release == 'true'
+        run: |
+          TAG=${{ steps.get_tag.outputs.tag }}
+          BUMP=${{ steps.bump_decision.outputs.bump }}
+          
+          if [[ $TAG =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            MAJOR=${BASH_REMATCH[1]}
+            MINOR=${BASH_REMATCH[2]}
+            PATCH=${BASH_REMATCH[3]}
+          
+            if [[ "$BUMP" == "major" ]]; then
+              MAJOR=$((MAJOR+1))
+              MINOR=0
+              PATCH=0
+            elif [[ "$BUMP" == "minor" ]]; then
+              MINOR=$((MINOR+1))
+              PATCH=0
+            else
+              PATCH=$((PATCH+1))
+            fi
+          
+            NEW_TAG="v$MAJOR.$MINOR.$PATCH"
+          else
+            NEW_TAG="v0.1.0"
+          fi
+          
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          git tag -a $NEW_TAG -m "Release $NEW_TAG"
+          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }} $NEW_TAG
+          
+          echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+
+      - name: Generate release notes
+        id: release_notes
+        if: steps.bump_decision.outputs.should_release == 'true'
+        run: |
+          TAG=${{ steps.get_tag.outputs.tag }}
+          NEW_TAG=${{ steps.bump_version.outputs.new_tag }}
+          
+          COMMITS=$(git log $TAG..HEAD --pretty=format:"- %s (%h)" --no-merges)
+          
+          NOTES="## Changes in $NEW_TAG"$'\n\n'
+          
+          FEATURES=$(echo "$COMMITS" | grep "^- feat" || true)
+          if [ ! -z "$FEATURES" ]; then
+            NOTES+="### Features"$'\n'
+            NOTES+="$FEATURES"$'\n\n'
+          fi
+          
+          FIXES=$(echo "$COMMITS" | grep "^- fix" || true)
+          if [ ! -z "$FIXES" ]; then
+            NOTES+="### Bug Fixes"$'\n'
+            NOTES+="$FIXES"$'\n\n'
+          fi
+          
+          DOCS=$(echo "$COMMITS" | grep "^- docs" || true)
+          if [ ! -z "$DOCS" ]; then
+            NOTES+="### Documentation"$'\n'
+            NOTES+="$DOCS"$'\n\n'
+          fi
+          
+          OTHER=$(echo "$COMMITS" | grep -v "^- feat\|^- fix\|^- docs" || true)
+          if [ ! -z "$OTHER" ]; then
+            NOTES+="### Other Changes"$'\n'
+            NOTES+="$OTHER"$'\n\n'
+          fi
+          
+          NOTES+="## Installation"$'\n\n'
+          NOTES+='```bash'$'\n'
+          NOTES+="go get github.com/elpol4k0/colorbear@$NEW_TAG"$'\n'
+          NOTES+='```'$'\n'
+          
+          echo "$NOTES" > release_notes.md
+
+      - name: Create GitHub Release
+        if: |
+          steps.bump_decision.outputs.should_release == 'true' &&
+          (steps.bump_decision.outputs.bump == 'major' || steps.bump_decision.outputs.bump == 'minor')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.bump_version.outputs.new_tag }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Patch release notification
+        if: |
+          steps.bump_decision.outputs.should_release == 'true' &&
+          steps.bump_decision.outputs.bump == 'patch'
+        run: |
+          echo "Patch release ${{ steps.bump_version.outputs.new_tag }} created (tag only)"
